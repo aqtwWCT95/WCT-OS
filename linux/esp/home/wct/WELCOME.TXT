@@ -1,0 +1,4 @@
+﻿WCT-OS LTS 1.0
+This is the FAT32 data partition.
+Files here persist across reboots.
+Try: python, nano hello.txt, ls /fat

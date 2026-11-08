@@ -1,0 +1,11 @@
+# demo.wct - WCT native script example
+theme ubuntu
+echo === WCT script demo ===
+set NAME WCT
+echo Hello $NAME
+cd \home\wct
+write demo-output.txt Hello from a WCT script
+cat demo-output.txt
+pwd
+sleep 1
+echo Done.

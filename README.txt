@@ -1,0 +1,37 @@
+WCT-OS LTS 1.0 — Source Only
+
+This folder contains source and build configuration only.
+No compiled EFI, kernel, initramfs, rootfs or disk image is included.
+
+Layout:
+  native/                 self-developed C UEFI shell
+    efi.h
+    main.c
+  linux/                  Linux compatibility build scripts
+    fetch_rootfs.py
+    trim_modules.py
+    prepare_rootfs.py
+    make_initramfs.py
+    make_wct_image.py
+    esp/                  ESP configuration and WCT scripts
+  build.ps1               full build (native + Linux rootfs + image)
+  build.cmd               Windows launcher for build.ps1
+  run.ps1                 QEMU launcher
+  start.cmd               Windows launcher for run.ps1
+
+Build requirements:
+  - Windows PowerShell 5.1+
+  - MinGW-w64 GCC (C:\mingw64\bin\gcc.exe or gcc on PATH)
+  - Python 3
+  - curl.exe
+  - Internet access to http://deb.debian.org/debian/
+
+Build:
+  build.cmd
+
+The build downloads Debian packages, creates the root filesystem and
+initramfs, compiles native/build/native.efi, and writes:
+  dist\WCT-OS-LTS-1.0.img
+
+The linux/esp/EFI/BOOT and linux/esp/wct directories are empty on
+purpose. build.ps1 places the compiled native EFI and Linux loader there.

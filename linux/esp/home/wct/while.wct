@@ -1,0 +1,7 @@
+# while.wct - WCT loop demo
+set i 0
+while $i < 5
+  echo Count: $i
+  inc i
+end
+echo Loop finished.
