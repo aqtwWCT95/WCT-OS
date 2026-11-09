@@ -5,6 +5,14 @@ static EFI_HANDLE g_image;
 static EFI_LOADED_IMAGE_PROTOCOL *g_loaded;
 static EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *FS;
 static EFI_FILE_PROTOCOL *ROOT;
+static EFI_FILE_PROTOCOL *BOOT_ROOT;
+#define MAX_VOLUMES 8
+static EFI_FILE_PROTOCOL *vol_roots[MAX_VOLUMES];
+static CHAR16 vol_labels[MAX_VOLUMES][32];
+static UINT64 vol_sizes[MAX_VOLUMES];
+static int vol_count;
+static int vol_boot = -1;
+static int vol_current;
 static CHAR16 CWD[128] = L"\\";
 static UINT8 boot_device_path[1024] __attribute__((aligned(8)));
 
@@ -36,6 +44,7 @@ static const CHAR16 *wct_logo[] = {
 
 static int theme_index = 1;
 static UINTN current_attr = 0x07;
+static UINTN output_color_override;
 #define LOG_MAX 128
 #define LOG_INFO 0
 #define LOG_WARN 1
@@ -106,6 +115,12 @@ static char script_var_values[SCRIPT_VARS][96];
 static int script_var_count;
 static void process_command(CHAR16 *line);
 static int log_save(int quiet);
+static void print_banner(void);
+static void cmd_clear(void);
+static void scopy(char *dst, UINTN cap, const char *src);
+static char *strim(char *text);
+static int scmp(const char *a, const char *b);
+static int resolve_mount(const CHAR16 *path, EFI_FILE_PROTOCOL **root, CHAR16 *relative, UINTN cap);
 static int completion_suffix(const CHAR16 *line, CHAR16 *suffix, UINTN cap);
 static UINTN input_start_col, input_start_row, drawn_total;
 #define HIST_MAX 16
@@ -135,6 +150,8 @@ static EFI_GUID simple_fs_guid =
     { 0x964E5B22, 0x6459, 0x11D2, { 0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B } };
 static EFI_GUID device_path_guid =
     { 0x09576E91, 0x6D3F, 0x11D2, { 0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B } };
+static EFI_GUID fs_info_guid =
+    { 0x09576E93, 0x6D3F, 0x11D2, { 0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B } };
 static EFI_GUID gop_guid =
     { 0x9042A9DE, 0x23DC, 0x4A38, { 0x96, 0xFB, 0x7A, 0xDE, 0xD0, 0x80, 0x51, 0x6A } };
 
@@ -206,7 +223,11 @@ static void wcat(CHAR16 *dst, UINTN cap, const CHAR16 *src)
 
 static void out(const CHAR16 *s)
 {
+    if (output_color_override)
+        ST->ConOut->SetAttribute(ST->ConOut, output_color_override);
     ST->ConOut->OutputString(ST->ConOut, (CHAR16 *)s);
+    if (output_color_override)
+        ST->ConOut->SetAttribute(ST->ConOut, current_attr);
 }
 
 static void outln(const CHAR16 *s)
@@ -792,15 +813,168 @@ static int open_path(const CHAR16 *path, EFI_FILE_PROTOCOL **file, UINT64 mode, 
     *file = NULL;
     if (!ROOT)
         return 0;
-    EFI_STATUS status = ROOT->Open(ROOT, file, (CHAR16 *)path, mode, attr);
+    EFI_FILE_PROTOCOL *root = ROOT;
+    CHAR16 relative[256];
+    const CHAR16 *use_path = path;
+    if (resolve_mount(path, &root, relative, sizeof(relative) / sizeof(relative[0])))
+        use_path = relative;
+    EFI_STATUS status = root->Open(root, file, (CHAR16 *)use_path, mode, attr);
     return !EFI_IS_ERROR(status) && *file;
+}
+
+static void scan_volumes(void)
+{
+    EFI_HANDLE *handles = NULL;
+    UINTN handle_count = 0;
+    vol_count = 0;
+    vol_boot = -1;
+    EFI_STATUS status = ST->BootServices->LocateHandleBuffer(
+        2, &simple_fs_guid, NULL, &handle_count, &handles);
+    if (EFI_IS_ERROR(status) || !handles)
+        return;
+
+    for (UINTN i = 0; i < handle_count && vol_count < MAX_VOLUMES; ++i) {
+        EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs = NULL;
+        if (EFI_IS_ERROR(ST->BootServices->HandleProtocol(handles[i], &simple_fs_guid, (VOID **)&fs)) || !fs)
+            continue;
+        EFI_FILE_PROTOCOL *root = NULL;
+        if (EFI_IS_ERROR(fs->OpenVolume(fs, &root)) || !root)
+            continue;
+
+        int idx = vol_count++;
+        vol_roots[idx] = root;
+        vol_sizes[idx] = 0;
+        wcopy(vol_labels[idx], 32, L"NO NAME");
+
+        static UINT8 info_buf[1024];
+        UINTN info_size = sizeof(info_buf);
+        if (!EFI_IS_ERROR(root->GetInfo(root, &fs_info_guid, &info_size, info_buf))) {
+            EFI_FILE_SYSTEM_INFO *info = (EFI_FILE_SYSTEM_INFO *)info_buf;
+            if (info->VolumeLabel[0])
+                wcopy(vol_labels[idx], 32, info->VolumeLabel);
+            vol_sizes[idx] = info->VolumeSize / (1024 * 1024);
+        }
+
+        if (g_loaded && handles[i] == g_loaded->DeviceHandle)
+            vol_boot = idx;
+    }
+    ST->BootServices->FreePool(handles);
+
+    if (vol_count == 0)
+        return;
+    if (vol_boot < 0)
+        vol_boot = 0;
+    vol_current = vol_boot;
+    ROOT = vol_roots[vol_boot];
+    BOOT_ROOT = ROOT;
+}
+
+static int usb_volume_for_number(UINTN number)
+{
+    int index = 0;
+    for (int i = 0; i < vol_count; ++i) {
+        if (i == vol_boot) continue;
+        if ((UINTN)index == number) return i;
+        ++index;
+    }
+    return -1;
+}
+
+static int resolve_mount(const CHAR16 *path, EFI_FILE_PROTOCOL **root, CHAR16 *relative, UINTN cap)
+{
+    if (!path || path[0] != L'\\' || !vol_count) return 0;
+    const CHAR16 *p = path + 1;
+    if ((p[0] != L'u' && p[0] != L'U') ||
+        (p[1] != L's' && p[1] != L'S') ||
+        (p[2] != L'b' && p[2] != L'B'))
+        return 0;
+    p += 3;
+    UINTN number = 0;
+    int digits = 0;
+    while (*p >= L'0' && *p <= L'9') {
+        number = number * 10 + (UINTN)(*p - L'0');
+        ++p;
+        ++digits;
+    }
+    if (!digits || (*p && *p != L'\\' && *p != L'/'))
+        return 0;
+    int vol = usb_volume_for_number(number);
+    if (vol < 0) return 0;
+    *root = vol_roots[vol];
+    if (!*p) {
+        wcopy(relative, cap, L"\\");
+    } else {
+        UINTN n = 0;
+        while (p[n] && n + 1 < cap) {
+            relative[n] = (p[n] == L'/') ? L'\\' : p[n];
+            ++n;
+        }
+        relative[n] = 0;
+    }
+    return 1;
+}
+
+static void cmd_usb(CHAR16 *args)
+{
+    if (weq(args, L"rescan")) {
+        scan_volumes();
+        outln(L"USB volumes rescanned");
+        return;
+    }
+    if (weq(args, L"boot")) {
+        wcopy(CWD, sizeof(CWD) / sizeof(CWD[0]), L"\\");
+        outln(L"switched to boot root");
+        return;
+    }
+    if (args[0]) {
+        UINTN n = 0;
+        for (UINTN i = 0; args[i]; ++i) {
+            if (args[i] < L'0' || args[i] > L'9') {
+                outln(L"usb: usage: usb | usb N | usb boot | usb rescan");
+                return;
+            }
+            n = n * 10 + (UINTN)(args[i] - L'0');
+        }
+        int vol = usb_volume_for_number(n);
+        if (vol < 0) {
+            outc(theme()->error, L"usb: mount not found\r\n");
+            return;
+        }
+        wcopy(CWD, sizeof(CWD) / sizeof(CWD[0]), L"\\usb");
+        CHAR16 digits[12];
+        int d = 0;
+        if (n == 0) digits[d++] = L'0';
+        while (n > 0 && d < 11) { digits[d++] = (CHAR16)(L'0' + n % 10); n /= 10; }
+        UINTN pos = wlen(CWD);
+        while (d > 0) CWD[pos++] = digits[--d];
+        CWD[pos] = 0;
+        out(L"switched to ");
+        outln(CWD);
+        return;
+    }
+
+    outln(L"USB mounts:");
+    int index = 0;
+    for (int i = 0; i < vol_count; ++i) {
+        if (i == vol_boot) continue;
+        out(L"  usb");
+        out_int(index);
+        out(L"/  ->  ");
+        out(vol_labels[i]);
+        out(L"  ");
+        out_int(vol_sizes[i]);
+        outln(L" MiB");
+        ++index;
+    }
+    if (index == 0) outln(L"  (none)");
+    outln(L"use: cd \\usb0 | usb 0 | usb boot | usb rescan");
 }
 
 static const char *native_commands[] = {
     "help", "ls", "cat", "edit", "write", "mkdir", "cd", "pwd", "run", "echo", "cp",
     "sleep", "theme", "font", "banner", "date", "hw", "mem", "log", "ps", "pid",
-    "kill", "sudo", "poweroff", "reboot", "linux", "native", "clear", "new",
-    "create", "touch", "script", "ver"
+    "kill", "sudo", "poweroff", "reboot", "linux", "native", "clear", "new", "pkg", "api", "usb",
+    "create", "touch", "script", "ver", "about", "color"
 };
 
 static int ci_prefix(const CHAR16 *text, const char *prefix)
@@ -1024,7 +1198,10 @@ static int log_save(int quiet)
     }
     buffer[n] = 0;
 
+    EFI_FILE_PROTOCOL *saved_root = ROOT;
+    if (BOOT_ROOT) ROOT = BOOT_ROOT;
     int ok = write_bytes(path, buffer, n);
+    ROOT = saved_root;
     if (!quiet) {
         if (ok) {
             out(L"saved: ");
@@ -1242,6 +1419,22 @@ static void cmd_ls(CHAR16 *args)
             reset_color();
         }
         outln(L"");
+    }
+    if (weq(path, L"\\")) {
+        int index = 0;
+        for (int i = 0; i < vol_count; ++i) {
+            if (i == vol_boot) continue;
+            out(L"  ");
+            outc(theme()->dir, L"usb");
+            out_int(index);
+            outc(theme()->dir, L"/");
+            out(L"  ");
+            set_color(theme()->dim);
+            out(vol_labels[i]);
+            reset_color();
+            outln(L"");
+            ++index;
+        }
     }
     dir->Close(dir);
 }
@@ -1465,6 +1658,101 @@ static void cmd_native(void)
     outln(L"WCT-OS Native is the primary boot environment.");
 }
 
+typedef struct {
+    char name[32];
+    char version[16];
+    char author[48];
+    char command[32];
+    char description[96];
+    char color[16];
+} PkgMeta;
+
+static void pkg_meta(const CHAR16 *file, PkgMeta *meta)
+{
+    for (UINTN i = 0; i < sizeof(*meta); ++i) ((UINT8 *)meta)[i] = 0;
+    static UINT8 data[4096];
+    UINTN size = read_whole_file(file, data, sizeof(data) - 1);
+    if (!size) return;
+    data[size] = 0;
+    char *p = (char *)data;
+    while (*p) {
+        char line[256];
+        UINTN n = 0;
+        while (*p && *p != '\n' && n + 1 < sizeof(line)) line[n++] = *p++;
+        if (*p == '\n') ++p;
+        line[n] = 0;
+        char *s = strim(line);
+        if (s[0] != '#') continue;
+        ++s;
+        while (*s == ' ' || *s == '\t') ++s;
+        char *colon = s;
+        while (*colon && *colon != ':') ++colon;
+        if (*colon != ':') continue;
+        *colon = 0;
+        char *key = strim(s);
+        char *value = strim(colon + 1);
+        if (!scmp(key, "name")) scopy(meta->name, sizeof(meta->name), value);
+        else if (!scmp(key, "version")) scopy(meta->version, sizeof(meta->version), value);
+        else if (!scmp(key, "author")) scopy(meta->author, sizeof(meta->author), value);
+        else if (!scmp(key, "command")) scopy(meta->command, sizeof(meta->command), value);
+        else if (!scmp(key, "description") || !scmp(key, "desc")) scopy(meta->description, sizeof(meta->description), value);
+        else if (!scmp(key, "color")) scopy(meta->color, sizeof(meta->color), value);
+    }
+}
+
+static void package_command_name(const CHAR16 *file, CHAR16 *out, UINTN cap)
+{
+    PkgMeta meta;
+    pkg_meta(file, &meta);
+    if (meta.command[0]) {
+        UINTN i = 0;
+        while (meta.command[i] && i + 1 < cap) { out[i] = (CHAR16)(unsigned char)meta.command[i]; ++i; }
+        out[i] = 0;
+        return;
+    }
+    wcopy(out, cap, file);
+    UINTN len = wlen(out);
+    if (len >= 7 && weq(out + len - 7, L".wctpkg")) out[len - 7] = 0;
+    else if (len >= 4 && weq(out + len - 4, L".wct")) out[len - 4] = 0;
+}
+
+static int list_package_commands(void)
+{
+    EFI_FILE_PROTOCOL *dir;
+    if (!open_path(L"\\packages", &dir, EFI_FILE_MODE_READ, 0)) return 0;
+    static UINT8 buf[2048];
+    int count = 0;
+    for (;;) {
+        UINTN size = sizeof(buf);
+        if (EFI_IS_ERROR(dir->Read(dir, &size, buf)) || size == 0) break;
+        EFI_FILE_INFO *info = (EFI_FILE_INFO *)buf;
+        if (!info->FileName[0]) break;
+        if (weq(info->FileName, L".") || weq(info->FileName, L"..")) continue;
+        CHAR16 path[256];
+        wcopy(path, sizeof(path) / sizeof(path[0]), L"\\packages\\");
+        wcat(path, sizeof(path) / sizeof(path[0]), info->FileName);
+        CHAR16 name[128];
+        package_command_name(path, name, sizeof(name) / sizeof(name[0]));
+        PkgMeta meta;
+        pkg_meta(path, &meta);
+        outc(theme()->prompt, name);
+        if (meta.version[0]) {
+            out(L"  v");
+            out_ascii(meta.version);
+        }
+        if (meta.description[0]) {
+            out(L"  ");
+            set_color(theme()->dim);
+            out_ascii(meta.description);
+            reset_color();
+        }
+        outln(L"");
+        ++count;
+    }
+    dir->Close(dir);
+    return count;
+}
+
 static void cmd_help(void)
 {
     outc(theme()->accent, L"WCT-OS Native");
@@ -1512,12 +1800,20 @@ static void cmd_help(void)
     outln(L"   hold RAM or show memory");
     outc(theme()->prompt, L"  ver");
     outln(L"               native system version");
+    outc(theme()->prompt, L"  about");
+    outln(L"             author and kernel version");
+    outc(theme()->prompt, L"  color NAME");
+    outln(L"        set terminal text colour");
     outc(theme()->prompt, L"  log [save|clear|LEVEL TEXT]");
     outln(L"  boot and command log");
     outc(theme()->prompt, L"  ps / pid / kill PID");
     outln(L"  process manager");
     outc(theme()->prompt, L"  sudo kill PID");
     outln(L"   force-kill protected process");
+    outc(theme()->prompt, L"  usb [N|boot|rescan]");
+    outln(L"  list and switch storage volumes");
+    outc(theme()->prompt, L"  pkg / api");
+    outln(L"           packages and system API");
     outc(theme()->prompt, L"  poweroff");
     outln(L"          shut down the machine");
     outc(theme()->prompt, L"  clear");
@@ -1531,6 +1827,8 @@ static void cmd_help(void)
     outln(L"  ----------------------------------------------------------");
     outln(L"  Shared FAT32: root is \\, Linux sees it as /fat");
     outln(L"  Themes: ubuntu  wct  matrix  amber  ice");
+    outln(L"  Package commands:");
+    if (!list_package_commands()) outln(L"  (none installed)");
 }
 
 static void cmd_ver(void)
@@ -1538,6 +1836,56 @@ static void cmd_ver(void)
     outln(L"WCT-OS Native Shell 1.0");
     outln(L"Freestanding C  /  x86_64 UEFI  /  FAT32 shared volume");
     outln(L"Compatibility subsystem: WCT-OS Linux (CPython 3.11.2)");
+}
+
+static void cmd_color(CHAR16 *args)
+{
+    if (!args[0] || weq(args, L"reset") || weq(args, L"default")) {
+        output_color_override = 0;
+        reset_color();
+        outln(L"color reset");
+        return;
+    }
+    UINTN attr = 0;
+    int found = 1;
+    if (weq(args, L"black")) attr = 0x00;
+    else if (weq(args, L"blue")) attr = 0x01;
+    else if (weq(args, L"green")) attr = 0x02;
+    else if (weq(args, L"cyan")) attr = 0x03;
+    else if (weq(args, L"red")) attr = 0x04;
+    else if (weq(args, L"magenta")) attr = 0x05;
+    else if (weq(args, L"brown")) attr = 0x06;
+    else if (weq(args, L"gray") || weq(args, L"lightgray")) attr = 0x07;
+    else if (weq(args, L"darkgray")) attr = 0x08;
+    else if (weq(args, L"lightblue")) attr = 0x09;
+    else if (weq(args, L"lightgreen")) attr = 0x0A;
+    else if (weq(args, L"lightcyan")) attr = 0x0B;
+    else if (weq(args, L"lightred")) attr = 0x0C;
+    else if (weq(args, L"lightmagenta") || weq(args, L"purple")) attr = 0x0D;
+    else if (weq(args, L"yellow")) attr = 0x0E;
+    else if (weq(args, L"white")) attr = 0x0F;
+    else found = 0;
+    if (!found) {
+        outln(L"color: black blue green cyan red magenta brown gray darkgray lightblue lightgreen lightcyan lightred purple yellow white");
+        return;
+    }
+    output_color_override = attr;
+    out(L"color set: ");
+    outln(args);
+}
+
+static void cmd_about(void)
+{
+    outc(theme()->accent, L"WCT-OS LTS 1.0");
+    outln(L"");
+    out(L"  Author : ");
+    outc(theme()->prompt, L"aqtwWCT95");
+    outln(L"");
+    out(L"  Kernel : ");
+    outc(theme()->bright, L"4.0.441");
+    outln(L"");
+    outln(L"  Native C UEFI shell / FAT32 / package API");
+    outln(L"  Linux compatibility subsystem embedded");
 }
 
 static UINTN slen(const char *s)
@@ -2307,6 +2655,254 @@ static void cmd_poweroff(void)
     outln(L"poweroff: firmware does not support shutdown");
 }
 
+static int ensure_pkg_dir(void)
+{
+    EFI_FILE_PROTOCOL *dir;
+    if (open_path(L"\\packages", &dir, EFI_FILE_MODE_READ, 0)) {
+        dir->Close(dir);
+        return 1;
+    }
+    if (open_path(L"\\packages", &dir, EFI_FILE_MODE_CREATE | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_READ, EFI_FILE_DIRECTORY)) {
+        dir->Close(dir);
+        return 1;
+    }
+    return 0;
+}
+
+static int ascii_wide_eq(const char *a, const CHAR16 *b)
+{
+    while (*a && *b) {
+        if ((CHAR16)(unsigned char)*a != *b) return 0;
+        ++a; ++b;
+    }
+    return *a == 0 && *b == 0;
+}
+
+static void run_package_script(const CHAR16 *path)
+{
+    PkgMeta meta;
+    pkg_meta(path, &meta);
+    if (meta.color[0]) {
+        CHAR16 color[16];
+        UINTN i = 0;
+        while (meta.color[i] && i + 1 < sizeof(color) / sizeof(color[0])) {
+            color[i] = (CHAR16)(unsigned char)meta.color[i];
+            ++i;
+        }
+        color[i] = 0;
+        cmd_color(color);
+    }
+    run_script(path);
+}
+
+static int find_package(const CHAR16 *name, CHAR16 *out)
+{
+    if (!name[0]) return 0;
+    CHAR16 path[256];
+    wcopy(path, sizeof(path) / sizeof(path[0]), L"\\packages\\");
+    wcat(path, sizeof(path) / sizeof(path[0]), name);
+    EFI_FILE_PROTOCOL *f = NULL;
+    if (open_path(path, &f, EFI_FILE_MODE_READ, 0)) {
+        f->Close(f);
+        wcopy(out, 256, path);
+        return 1;
+    }
+    const CHAR16 *exts[] = { L".wctpkg", L".wct" };
+    for (int e = 0; e < 2; ++e) {
+        CHAR16 alt[256];
+        wcopy(alt, sizeof(alt) / sizeof(alt[0]), path);
+        wcat(alt, sizeof(alt) / sizeof(alt[0]), exts[e]);
+        if (open_path(alt, &f, EFI_FILE_MODE_READ, 0)) {
+            f->Close(f);
+            wcopy(out, 256, alt);
+            return 1;
+        }
+    }
+
+    EFI_FILE_PROTOCOL *dir;
+    if (!open_path(L"\\packages", &dir, EFI_FILE_MODE_READ, 0)) return 0;
+    static UINT8 buf[2048];
+    int found = 0;
+    for (;;) {
+        UINTN size = sizeof(buf);
+        if (EFI_IS_ERROR(dir->Read(dir, &size, buf)) || size == 0) break;
+        EFI_FILE_INFO *info = (EFI_FILE_INFO *)buf;
+        if (!info->FileName[0]) break;
+        if (weq(info->FileName, L".") || weq(info->FileName, L"..")) continue;
+        CHAR16 file[256];
+        wcopy(file, sizeof(file) / sizeof(file[0]), L"\\packages\\");
+        wcat(file, sizeof(file) / sizeof(file[0]), info->FileName);
+        PkgMeta meta;
+        pkg_meta(file, &meta);
+        if (meta.command[0] && ascii_wide_eq(meta.command, name)) {
+            wcopy(out, 256, file);
+            found = 1;
+            break;
+        }
+    }
+    dir->Close(dir);
+    return found;
+}
+
+static void cmd_pkg(CHAR16 *args)
+{
+    CHAR16 *sub, *rest;
+    split_first(args, &sub, &rest);
+    if (!sub[0] || weq(sub, L"list")) {
+        if (!ensure_pkg_dir()) {
+            outc(theme()->error, L"pkg: cannot create \\packages\r\n");
+            return;
+        }
+        outln(L"Installed packages (command : file):");
+        if (!list_package_commands()) outln(L"  (none)");
+        outln(L"use: pkg install FILE | pkg run NAME | pkg remove NAME");
+        return;
+    }
+    if (weq(sub, L"install")) {
+        if (!rest[0]) { outln(L"pkg install: missing source file"); return; }
+        if (!ensure_pkg_dir()) { outc(theme()->error, L"pkg: cannot create \\packages\r\n"); return; }
+        const CHAR16 *base = rest;
+        for (const CHAR16 *p = rest; *p; ++p)
+            if (*p == L'\\' || *p == L'/') base = p + 1;
+        if (!base[0]) { outln(L"pkg install: invalid file name"); return; }
+        CHAR16 dest[256];
+        wcopy(dest, sizeof(dest) / sizeof(dest[0]), L"\\packages\\");
+        wcat(dest, sizeof(dest) / sizeof(dest[0]), base);
+        CHAR16 copy_args[520];
+        wcopy(copy_args, sizeof(copy_args) / sizeof(copy_args[0]), rest);
+        wcat(copy_args, sizeof(copy_args) / sizeof(copy_args[0]), L" ");
+        wcat(copy_args, sizeof(copy_args) / sizeof(copy_args[0]), dest);
+        cmd_cp(copy_args);
+        return;
+    }
+    if (weq(sub, L"run")) {
+        if (!rest[0]) { outln(L"pkg run: missing package name"); return; }
+        CHAR16 path[256];
+        if (!find_package(rest, path)) {
+            outc(theme()->error, L"pkg run: package not found\r\n");
+            return;
+        }
+        run_package_script(path);
+        return;
+    }
+    if (weq(sub, L"remove")) {
+        if (!rest[0]) { outln(L"pkg remove: missing package name"); return; }
+        CHAR16 path[256];
+        if (!find_package(rest, path)) {
+            outc(theme()->error, L"pkg remove: package not found\r\n");
+            return;
+        }
+        remove_path(path);
+        outln(L"removed");
+        return;
+    }
+    if (weq(sub, L"info")) {
+        CHAR16 path[256];
+        if (!find_package(rest, path)) {
+            outc(theme()->error, L"pkg info: package not found\r\n");
+            return;
+        }
+        PkgMeta meta;
+        pkg_meta(path, &meta);
+        out(L"name    : "); out_ascii(meta.name[0] ? meta.name : "?"); outln(L"");
+        out(L"version : "); out_ascii(meta.version[0] ? meta.version : "0.0"); outln(L"");
+        out(L"author  : "); out_ascii(meta.author[0] ? meta.author : "?"); outln(L"");
+        out(L"command : "); out_ascii(meta.command[0] ? meta.command : "?"); outln(L"");
+        out(L"color   : "); out_ascii(meta.color[0] ? meta.color : "default"); outln(L"");
+        out(L"desc    : "); out_ascii(meta.description); outln(L"");
+        outln(L"---");
+        cmd_cat(path);
+        return;
+    }
+    outln(L"pkg: list | install FILE | run NAME | remove NAME | info NAME");
+}
+
+static int try_package_command(const CHAR16 *name)
+{
+    CHAR16 path[256];
+    if (!find_package(name, path)) return 0;
+    run_package_script(path);
+    return 1;
+}
+
+static void cmd_api(CHAR16 *args)
+{
+    CHAR16 *sub, *rest, *method, *params;
+    split_first(args, &sub, &rest);
+    if (!sub[0] || weq(sub, L"list")) {
+        outln(L"WCT-OS Package API");
+        outln(L"  term.write TEXT     print text to terminal");
+        outln(L"  term.color NAME     set text colour");
+        outln(L"  term.clear          clear screen, redraw banner");
+        outln(L"  term.banner         redraw WCT-OS banner");
+        outln(L"  term.exec CMD       run any shell command");
+        outln(L"  task.list           list native process table");
+        outln(L"  task.kill PID       kill process (1/2 protected)");
+        outln(L"  task.poweroff       save log, show logo, power off");
+        outln(L"  fs.ls [PATH]        list FAT32 directory");
+        outln(L"  fs.cat FILE         print a file");
+        outln(L"  fs.write FILE TEXT  overwrite file with one line");
+        outln(L"  fs.cp SRC DST       copy a file");
+        outln(L"  fs.rm FILE          delete a file");
+        outln(L"  fs.mkdir DIR        create a directory");
+        outln(L"  pkg.list            list installed packages");
+        outln(L"  pkg.run NAME        run a package");
+        outln(L"  sys.hw              show CPU/firmware/memory");
+        outln(L"  sys.log [ARGS]      view/write/clear/save log");
+        outln(L"  cmd.list            list all native commands");
+        outln(L"  cmd.NAME ARGS       call native command NAME");
+        outln(L"  usage: api call METHOD ARGS");
+        return;
+    }
+    if (!weq(sub, L"call")) {
+        outln(L"api: usage: api list | api call METHOD ARGS");
+        return;
+    }
+    split_first(rest, &method, &params);
+    if (!method[0]) { outln(L"api call: missing method"); return; }
+
+    if (weq(method, L"term.write")) cmd_echo(params);
+    else if (weq(method, L"term.color")) cmd_color(params);
+    else if (weq(method, L"term.clear")) cmd_clear();
+    else if (weq(method, L"term.banner")) { ST->ConOut->ClearScreen(ST->ConOut); print_banner(); }
+    else if (weq(method, L"term.exec")) { if (params[0]) process_command(params); }
+    else if (weq(method, L"task.list")) cmd_ps();
+    else if (weq(method, L"task.kill")) cmd_kill(params, 0);
+    else if (weq(method, L"task.poweroff")) cmd_poweroff();
+    else if (weq(method, L"fs.ls")) cmd_ls(params);
+    else if (weq(method, L"fs.cat")) cmd_cat(params);
+    else if (weq(method, L"fs.write")) cmd_write(params);
+    else if (weq(method, L"fs.cp")) cmd_cp(params);
+    else if (weq(method, L"fs.rm")) cmd_rm(params);
+    else if (weq(method, L"fs.mkdir")) cmd_mkdir(params);
+    else if (weq(method, L"pkg.list")) cmd_pkg(L"list");
+    else if (weq(method, L"pkg.run")) {
+        CHAR16 pkgargs[256];
+        wcopy(pkgargs, sizeof(pkgargs) / sizeof(pkgargs[0]), L"run ");
+        wcat(pkgargs, sizeof(pkgargs) / sizeof(pkgargs[0]), params);
+        cmd_pkg(pkgargs);
+    }
+    else if (weq(method, L"cmd.list")) {
+        for (UINTN i = 0; i < sizeof(native_commands) / sizeof(native_commands[0]); ++i) {
+            out_ascii(native_commands[i]); outln(L"");
+        }
+        outln(L"[package commands]");
+        list_package_commands();
+    }
+    else if (wprefix(method, L"cmd.")) {
+        CHAR16 call[512];
+        wcopy(call, sizeof(call) / sizeof(call[0]), method + 4);
+        if (params[0]) { wcat(call, sizeof(call) / sizeof(call[0]), L" "); wcat(call, sizeof(call) / sizeof(call[0]), params); }
+        process_command(call);
+    }
+    else if (weq(method, L"sys.hw")) cmd_hw();
+    else if (weq(method, L"sys.log")) cmd_log(params);
+    else {
+        outc(theme()->error, L"api: unknown method ");
+        outln(method);
+    }
+}
+
 static void print_banner(void)
 {
     UINTN cols = 0, rows = 0;
@@ -2465,7 +3061,12 @@ static void process_command(CHAR16 *line)
     else if (weq(command, L"kill")) cmd_kill(args, 0);
     else if (weq(command, L"sudo")) cmd_sudo(args);
     else if (weq(command, L"poweroff")) cmd_poweroff();
+    else if (weq(command, L"pkg")) cmd_pkg(args);
+    else if (weq(command, L"api")) cmd_api(args);
+    else if (weq(command, L"usb")) cmd_usb(args);
     else if (weq(command, L"ver")) cmd_ver();
+    else if (weq(command, L"about")) cmd_about();
+    else if (weq(command, L"color")) cmd_color(args);
     else if (weq(command, L"clear")) cmd_clear();
     else if (weq(command, L"banner")) { ST->ConOut->ClearScreen(ST->ConOut); print_banner(); }
     else if (weq(command, L"theme") || weq(command, L"color")) cmd_theme(args);
@@ -2473,10 +3074,10 @@ static void process_command(CHAR16 *line)
     else if (weq(command, L"linux")) cmd_linux();
     else if (weq(command, L"native")) cmd_native();
     else if (weq(command, L"reboot")) reset_system();
-    else {
+    else if (!try_package_command(command)) {
         outc(theme()->error, L"unknown command: ");
         outln(command);
-        outln(L"Type 'help'.");
+        outln(L"Type 'help' or install a package command.");
     }
 }
 
@@ -2499,6 +3100,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *st)
             FS->OpenVolume(FS, &ROOT);
         }
     }
+    scan_volumes();
+    if (!BOOT_ROOT) BOOT_ROOT = ROOT;
     if (ROOT) {
         EFI_FILE_PROTOCOL *linux_loader = NULL;
         if (open_path(L"\\wct\\bootx64.efi", &linux_loader, EFI_FILE_MODE_READ, 0)) {

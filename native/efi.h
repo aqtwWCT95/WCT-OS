@@ -171,7 +171,7 @@ typedef struct {
     void *CloseProtocol;
     void *OpenProtocolInformation;
     void *ProtocolsPerHandle;
-    void *LocateHandleBuffer;
+    EFI_STATUS (EFIAPI *LocateHandleBuffer)(UINT32 SearchType, EFI_GUID *Protocol, VOID *SearchKey, UINTN *NoHandles, EFI_HANDLE **Buffer);
     EFI_STATUS (EFIAPI *LocateProtocol)(EFI_GUID*, VOID*, VOID**);
     void *InstallMultipleProtocolInterfaces;
     void *UninstallMultipleProtocolInterfaces;
@@ -214,6 +214,15 @@ typedef struct {
 #define EFI_FILE_DIRECTORY   0x0000000000000010ULL
 #define EFI_RESET_COLD 0
 #define EFI_RESET_SHUTDOWN 2
+
+typedef struct {
+    UINT64 Size;
+    BOOLEAN ReadOnly;
+    UINT64 VolumeSize;
+    UINT64 FreeSpace;
+    UINT32 BlockSize;
+    CHAR16 VolumeLabel[1];
+} EFI_FILE_SYSTEM_INFO;
 
 typedef struct _EFI_MEMORY_DESCRIPTOR {
     UINT32 Type;

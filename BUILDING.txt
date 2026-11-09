@@ -26,8 +26,11 @@ Build requirements:
   - curl.exe
   - Internet access to http://deb.debian.org/debian/
 
-Build:
+Build full image:
   build.cmd
+
+Build 64 MiB Native Only image:
+  build-native-only.cmd
 
 The build downloads Debian packages, creates the root filesystem and
 initramfs, compiles native/build/native.efi, and writes:
