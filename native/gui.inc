@@ -12,8 +12,7 @@ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 GNU Affero General Public License for more details.
 
 You should have received a copy of the GNU Affero General Public License
-along with this program.  If not, see <https://www.gnu.org/licenses/>
-*/
+along with this program.  If not, see <https://www.gnu.org/licenses/>*/
 
 /* =========================================================
    1. 基础底层与依赖库引入
@@ -83,6 +82,11 @@ static int ui_admin = 0;
 static char gui_cap[8192]; 
 static int gui_cap_len = 0;
 
+// 锁屏相关状态变量
+static int screen_locked = 0;
+static char lock_input[32]; 
+static int lock_len = 0;
+
 /* =========================================================
    4. 核心前向声明
    ========================================================= */
@@ -94,7 +98,7 @@ static void draw_all(void);
 static void handle_click(void);
 
 /* =========================================================
-   5. 主题与壁纸 (提供颜色变量)
+   5. 主题与壁纸
    ========================================================= */
 #include "theme.h"
 #include "wallpaper.h"
@@ -158,16 +162,13 @@ static void gfx_out_wide(const CHAR16 *s) {
 /* =========================================================
    9. 引入插件化应用与外围组件
    ========================================================= */
-#include "app_api.h"   // 定义应用标准
-#include "icons.h"     // 图标
-#include "apps.h"      // 具体应用实现
-
-// 🚀 核心应用注册表：未来加新应用，只需要修改 registry.h 即可！
+#include "app_api.h"   
+#include "icons.h"     
+#include "apps.h"      
 #include "registry.h"  
-
-#include "window.h"    // 窗口外壳（依赖注册表提取标题）
-#include "drag.h"      // 幽灵框特效
-#include "desktop.h"   // 桌面环境（壁纸、图标、任务栏）
+#include "window.h"    
+#include "drag.h"      
+#include "desktop.h"   
 
 /* =========================================================
    10. 窗口核心管理
@@ -192,18 +193,15 @@ static void win_close(int i) {
 }
 
 static int win_open(int type) {
-    // 如果窗口已存在，直接提到最顶层
     for (int i = 0; i < WIN_MAX; ++i) 
         if (wins[i].alive && wins[i].type == type) { focus_win = i; wins[i].z = ++z_top; return i; }
     
-    // 🚀 核心改变：从注册表查找应用定义
     const AppDef *app = NULL;
     for (int i = 0; i < APP_COUNT; ++i) {
         if (g_apps[i]->type_id == type) { app = g_apps[i]; break; }
     }
-    if (!app) return -1; // 未注册的应用
+    if (!app) return -1; 
 
-    // 创建并挂载窗口
     for (int i = 0; i < WIN_MAX; ++i) {
         if (wins[i].alive) continue;
         GuiWin *w = &wins[i]; 
@@ -214,7 +212,6 @@ static int win_open(int type) {
         for (int k = 0; k < WIN_MAX; ++k) if (wins[k].alive) ++n;
         w->x = 70 + n * 40; w->y = 90 + n * 30;
         
-        // 🚀 自动挂载
         w->w = app->def_w; 
         w->h = app->def_h;
         w->on_draw = app->on_draw;
@@ -253,13 +250,20 @@ static void handle_click(void) {
         return;
     }
     
+    // 修复：桌面右键菜单新建功能
     if (ui_desk_ctx) { 
         int x = ui_desk_x, y = ui_desk_y; 
         for (int i = 0; i < 3; ++i) { 
             int iy = y + 28 + i * 26; 
             if (ui_hit(x + 2, iy, 186, 24)) { 
                 ui_desk_ctx = 0; 
-                if (i == 0) { draw_desktop(); gfx_present(); } 
+                if (i == 0) { 
+                    draw_desktop(); gfx_present(); 
+                } else if (i == 1) { 
+                    cmd_mkdir(L"\\NewFolder"); 
+                } else if (i == 2) { 
+                    cmd_new(L"\\NewFile.txt"); 
+                }
                 return; 
             } 
         } 
@@ -279,6 +283,12 @@ static void handle_click(void) {
                 else if (i == 3) win_open(WIN_TASK); 
                 else if (i == 4) win_open(WIN_RUN); 
                 else if (i == 5) win_open(WIN_ABOUT); 
+                // 修复：增加了锁屏触发
+                else if (i == 6) { 
+                    screen_locked = 1; 
+                    lock_len = 0; lock_input[0] = 0;
+                    return; 
+                }
                 else if (i == 7) ST->RuntimeServices->ResetSystem(EFI_RESET_COLD, EFI_SUCCESS, 0, NULL); 
                 else if (i == 8) ST->RuntimeServices->ResetSystem(EFI_RESET_SHUTDOWN, EFI_SUCCESS, 0, NULL); 
                 return; 
@@ -288,14 +298,12 @@ static void handle_click(void) {
         return;
     }
     
-    // 桌面图标点击（🚀 动态调用）
     int clicked_app = desktop_icon_click();
     if (clicked_app >= 0) {
         win_open(clicked_app);
         return;
     }
     
-    // 底部任务栏
     if (mouse_y >= (int)gfx_h - 34) { 
         if (ui_hit(6, (int)gfx_h - 30, 64, 26)) { ui_menu = !ui_menu; return; } 
         int bx = 78; 
@@ -326,6 +334,9 @@ static void draw_all(void) {
     gfx_cursor(); 
 }
 
+// 🚀 引入配置向导 (必须在 ui_btn 等 UI 组件之后，gui_loop 之前)
+#include "setup.h"
+
 /* =========================================================
    12. 主事件循环与入口
    ========================================================= */
@@ -336,11 +347,118 @@ static void gui_loop(void) {
     mouse_down = mouse_was_down = 0; cursor_bg_x = cursor_bg_y = -1;
     for (int i = 0; i < WIN_MAX; ++i) wins[i].alive = 0;
     
+    // 🚀 读取 setting.txt 决定是否启动向导
+    static UINT8 cfg[256];
+    UINTN sz = read_whole_file(L"\\setting.txt", cfg, sizeof(cfg) - 1);
+    if (sz > 0) {
+        cfg[sz] = 0;
+        for (char *c = (char *)cfg; *c; ++c) {
+            if (c[0]=='l' && c[1]=='a' && c[2]=='n' && c[3]=='g' && c[4]=='=') {
+                ui_lang = c[5] - '0';
+            }
+            if (c[0]=='t' && c[1]=='h' && c[2]=='e' && c[3]=='m' && c[4]=='=') {
+                theme_index = c[6] - '0';
+            }
+        }
+        apply_theme();
+        in_setup = 0;
+    } else {
+        setup_lang_sel = ui_lang;
+        setup_theme_sel = theme_index;
+        in_setup = 1;
+    }
+
     win_open(WIN_TERM); 
     dframe_end(); 
     int dirty = 1, force_full = 1;
     
     while (!gfx_done) {
+        // 🚀 拦截配置向导
+        if (in_setup) {
+            mouse_poll();
+            
+            // 🚀 修复：鼠标移动或点击都要重绘
+            if (mouse_moved || mouse_click) {
+                if (mouse_click) setup_click();
+                cursor_restore_bg();
+                force_full = 1;
+            }
+            
+            // 🚀 新增：支持键盘操作
+            EFI_INPUT_KEY k;
+            if (!EFI_IS_ERROR(ST->ConIn->ReadKeyStroke(ST->ConIn, &k))) {
+                if (k.UnicodeChar == '\r' || k.UnicodeChar == '\n' || k.ScanCode == 0x0D) {
+                    setup_save(); // 回车直接保存
+                } else if (k.UnicodeChar == '1') {
+                    setup_lang_sel = 0; force_full = 1; // 按 1 中文
+                } else if (k.UnicodeChar == '2') {
+                    setup_lang_sel = 1; force_full = 1; // 按 2 英文
+                } else if (k.ScanCode == 0x03) { // 左方向键
+                    setup_theme_sel = (setup_theme_sel + 5) % 6; force_full = 1;
+                } else if (k.ScanCode == 0x04) { // 右方向键
+                    setup_theme_sel = (setup_theme_sel + 1) % 6; force_full = 1;
+                }
+            }
+            
+            if (force_full) {
+                setup_draw();
+                gfx_cursor();
+                gfx_present();
+                force_full = 0;
+            }
+            ST->BootServices->Stall(100);
+            continue;
+        }
+
+        // 锁屏状态拦截
+        if (screen_locked) {
+            if (force_full) {
+                gfx_fill(0, 0, (int)gfx_w, (int)gfx_h, gfx_rgb(8, 10, 18));
+                const CHAR16 *title = T(S_LOCKED);
+                int tw = 0; for (const CHAR16 *q = title; *q; ++q) tw += (*q <= 126) ? 8 : 16;
+                gfx_text_w(((int)gfx_w - tw) / 2, (int)gfx_h / 2 - 40, title, gfx_accent);
+                
+                int bw = 240, bh = 32;
+                int bx = ((int)gfx_w - bw) / 2, by = (int)gfx_h / 2;
+                gfx_fill(bx, by, bw, bh, gfx_rgb(20, 24, 34));
+                gfx_border(bx, by, bw, bh, gfx_accent);
+                
+                CHAR16 stars[33];
+                int sn = 0;
+                for (int i = 0; i < lock_len && i < 32; ++i) stars[sn++] = L'*';
+                stars[sn] = 0;
+                gfx_text_w(bx + 8, by + 8, stars, gfx_text_c);
+                gfx_fill(bx + 8 + lock_len * 8, by + 6, 2, 20, gfx_accent);
+                
+                const CHAR16 *hint = T(S_UNLOCK_HINT);
+                int hw = 0; for (const CHAR16 *q = hint; *q; ++q) hw += (*q <= 126) ? 8 : 16;
+                gfx_text_w(((int)gfx_w - hw) / 2, by + bh + 20, hint, gfx_dim);
+                
+                gfx_present();
+                force_full = 0; dirty = 0;
+            }
+            
+            EFI_INPUT_KEY k;
+            if (!EFI_IS_ERROR(ST->ConIn->ReadKeyStroke(ST->ConIn, &k))) {
+                if (k.UnicodeChar == '\r' || k.UnicodeChar == '\n') {
+                    lock_input[lock_len] = 0;
+                    if (scmp(lock_input, "wct") == 0) {
+                        screen_locked = 0; lock_len = 0; lock_input[0] = 0;
+                        force_full = 1; dirty = 1;
+                    } else {
+                        lock_len = 0; lock_input[0] = 0;
+                    }
+                } else if (k.UnicodeChar == 8) {
+                    if (lock_len > 0) lock_input[--lock_len] = 0;
+                } else if (k.UnicodeChar >= 32 && k.UnicodeChar < 127 && lock_len < 31) {
+                    lock_input[lock_len++] = (char)k.UnicodeChar;
+                }
+                force_full = 1;
+            }
+            ST->BootServices->Stall(10000);
+            continue;
+        }
+
         int prev_mx = mouse_x, prev_my = mouse_y; 
         int prev_cx = cursor_bg_x, prev_cy = cursor_bg_y;
         
@@ -406,7 +524,7 @@ static void gui_loop(void) {
             } 
             dirty = 0; force_full = 0; 
         }
-        ST->BootServices->Stall(1000);
+        ST->BootServices->Stall(100);
     }
     dframe_end();
 }

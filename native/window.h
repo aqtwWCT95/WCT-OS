@@ -7,10 +7,10 @@ extern const int APP_COUNT;
 extern int ui_lang;
 
 static void draw_window_frame(GuiWin *w) {
-    UINT32 border = (focus_win == w->type) ? gfx_accent : gfx_dim;
+    // 修复：正确使用指针偏移来计算窗口索引，判断是否拥有焦点
+    UINT32 border = ((w - wins) == focus_win) ? gfx_accent : gfx_dim;
     const CHAR16 *title = L"WCT-OS";
     
-    // 🚀 核心改变：从注册表中动态匹配标题
     for (int i = 0; i < APP_COUNT; ++i) {
         if (g_apps[i]->type_id == w->type) {
             title = ui_lang ? g_apps[i]->title_en : g_apps[i]->title_zh;
