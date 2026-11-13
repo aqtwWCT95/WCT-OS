@@ -1,0 +1,10 @@
+#!wctpkg
+# name: Hello
+# version: 1.0.0
+# author: aqtwWCT95
+# command: hello
+# description: print a green greeting
+# color: green
+api call term.write Hello from a .wctpkg package
+api call term.write Author: aqtwWCT95
+api call term.write Version: 1.0.0
