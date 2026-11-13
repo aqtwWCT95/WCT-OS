@@ -165,6 +165,7 @@ static void gfx_out_wide(const CHAR16 *s) {
 #include "app_api.h"   
 #include "icons.h"     
 #include "apps.h"      
+#include "win_api.h"          /* ★ 新增：脚本窗口系统 */
 #include "registry.h"  
 #include "window.h"    
 #include "drag.h"      
@@ -183,7 +184,21 @@ static int win_at(int x, int y) {
 
 static void win_close(int i) { 
     if (i >= 0 && i < WIN_MAX) { 
+        int was_alive = wins[i].alive;              /* ★ */
         wins[i].alive = 0; 
+
+        /* ★ 脚本窗口 on_close 回调 */
+        if (was_alive && !s_in_close &&
+            wins[i].type >= SCRIPTWIN_BASE &&
+            wins[i].type <  SCRIPTWIN_BASE + SCRIPTWIN_N) {
+            int slot = wins[i].type - SCRIPTWIN_BASE;
+            if (s_wins[slot].close_label[0]) {
+                s_in_close = 1;
+                fire_event(s_wins[slot].close_label);
+                s_in_close = 0;
+            }
+        }
+
         if (focus_win == i) { 
             focus_win = -1; 
             for (int k = 0; k < WIN_MAX; ++k) 
@@ -193,6 +208,10 @@ static void win_close(int i) {
 }
 
 static int win_open(int type) {
+    /* ★ 脚本窗口分流 */
+    if (type >= SCRIPTWIN_BASE && type < SCRIPTWIN_BASE + SCRIPTWIN_N)
+        return sw_open_window(type);
+
     for (int i = 0; i < WIN_MAX; ++i) 
         if (wins[i].alive && wins[i].type == type) { focus_win = i; wins[i].z = ++z_top; return i; }
     
@@ -293,7 +312,7 @@ static void handle_click(void) {
                 else if (i == 8) ST->RuntimeServices->ResetSystem(EFI_RESET_SHUTDOWN, EFI_SUCCESS, 0, NULL); 
                 return; 
             } 
-        }
+        } 
         ui_menu = 0; 
         return;
     }

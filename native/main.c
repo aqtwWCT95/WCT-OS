@@ -135,6 +135,9 @@ static char script_var_names[SCRIPT_VARS][24];
 static char script_var_values[SCRIPT_VARS][96];
 static int script_var_count;
 static void process_command(CHAR16 *line);
+static void win_api_load_script(const char *t, int n);
+static void win_api_unload_script(void);                 
+static void win_api_cmd(CHAR16 *args);                 
 static int log_save(int quiet);
 static void print_banner(void);
 static void cmd_clear(void);
@@ -2146,7 +2149,9 @@ static int script_condition(const char *condition)
 
 static void script_exec_line(char *line)
 {
-    if (sprefix(line, "set ")) {
+     if (line[0] == ':') return;
+     if (!scmp(line, "ret")) return;
+     if (sprefix(line, "set ")) {
         char *rest = strim(line + 4);
         char *value = rest;
         while (*value && *value != ' ') ++value;
@@ -2183,7 +2188,8 @@ static int script_exec_block(char lines[][256], int start, int end, int depth)
         scopy(line, sizeof(line), lines[i]);
         char *s = strim(line);
         if (!s[0] || s[0] == '#' || s[0] == '}' || !scmp(s, "end"))
-            continue;
+             continue;
+        if (!scmp(s, "ret")) return 0;   
 
         if (sprefix(s, "while ")) {
             char cond[256];
@@ -2300,6 +2306,7 @@ static void run_script(const CHAR16 *path)
         outc(theme()->error, L"run: recursion limit reached\r\n");
         return;
     }
+    win_api_load_script((char *)data, (int)size);
     ++script_depth;
 
     static char lines[256][256];
@@ -2320,6 +2327,7 @@ static void run_script(const CHAR16 *path)
     }
 
     script_exec_block(lines, 0, count, 0);
+    win_api_unload_script();
     --script_depth;
 }
 
@@ -3114,6 +3122,7 @@ static void process_command(CHAR16 *line)
     else if (weq(command, L"poweroff")) cmd_poweroff();
     else if (weq(command, L"pkg")) cmd_pkg(args);
     else if (weq(command, L"api")) cmd_api(args);
+    else if (weq(command, L"win") || weq(command, L"winapi")) win_api_cmd(args);
     else if (weq(command, L"usb")) cmd_usb(args);
     else if (weq(command, L"ver")) cmd_ver();
     else if (weq(command, L"about")) cmd_about();

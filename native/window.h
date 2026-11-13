@@ -17,6 +17,13 @@ static void draw_window_frame(GuiWin *w) {
             break;
         }
     }
+
+    /* ★ 脚本窗口用自己的标题 */
+    if (w->type >= SCRIPTWIN_BASE && w->type < SCRIPTWIN_BASE + SCRIPTWIN_N) {
+        ScriptWin *sw = &s_wins[w->type - SCRIPTWIN_BASE];
+        title = ui_lang ? sw->title_en : sw->title_zh;
+        if (!title[0]) title = L"WCT-OS";
+    }
     
     gfx_fill(w->x, w->y, w->w, w->h, gfx_panel); 
     gfx_border(w->x, w->y, w->w, w->h, border);
